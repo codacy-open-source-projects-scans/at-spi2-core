@@ -341,6 +341,8 @@ register_reply (DBusPendingCall *pending, void *user_data)
   DBusMessage *reply;
   SpiBridge *app = user_data;
 
+  app->register_pending = NULL;
+
   reply = dbus_pending_call_steal_reply (pending);
   dbus_pending_call_unref (pending);
 
@@ -412,6 +414,7 @@ register_application (gpointer data)
       return FALSE;
     }
 
+  app->register_pending = pending;
   dbus_pending_call_set_notify (pending, register_reply, app, NULL);
 
   if (message)
@@ -572,7 +575,7 @@ socket_ref_state_set (AtkObject *accessible)
       dbus_message_iter_get_basic (&iter_array, &v);
       for (j = 0; j < 32; j++)
         {
-          if (v & (1 << j))
+          if (v & (1u << j))
             {
               AtkState state = spi_atk_state_from_spi_state ((count << 5) + j);
               atk_state_set_add_state (set, state);
@@ -678,15 +681,51 @@ user_check (DBusConnection *bus, unsigned long uid, void *data)
 }
 
 static void
+remove_direct_connection (DBusConnection *connection)
+{
+  GList *link;
+
+  link = g_list_find (spi_global_app_data->direct_connections, connection);
+  if (!link)
+    return;
+
+  droute_context_unregister (spi_global_app_data->droute, connection);
+  droute_unintercept_dbus (connection);
+  spi_global_app_data->direct_connections =
+      g_list_delete_link (spi_global_app_data->direct_connections, link);
+  dbus_connection_unref (connection);
+}
+
+static DBusHandlerResult
+direct_connection_filter (DBusConnection *connection,
+                          DBusMessage *message,
+                          void *user_data)
+{
+  if (dbus_message_is_signal (message, DBUS_INTERFACE_LOCAL, "Disconnected"))
+    {
+      dbus_connection_remove_filter (connection,
+                                     direct_connection_filter,
+                                     NULL);
+      remove_direct_connection (connection);
+    }
+
+  return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+static void
 new_connection_cb (DBusServer *server, DBusConnection *con, void *data)
 {
   dbus_connection_set_unix_user_function (con, user_check, NULL, NULL);
+  if (!dbus_connection_add_filter (con, direct_connection_filter, NULL, NULL))
+    return;
+
   dbus_connection_ref (con);
   atspi_dbus_connection_setup_with_g_main (con, spi_context);
   droute_intercept_dbus (con);
   droute_context_register (spi_global_app_data->droute, con);
 
-  spi_global_app_data->direct_connections = g_list_append (spi_global_app_data->direct_connections, con);
+  spi_global_app_data->direct_connections =
+      g_list_append (spi_global_app_data->direct_connections, con);
 }
 
 static gchar *atspi_dbus_name = NULL;
@@ -1009,6 +1048,8 @@ spi_atk_activate ()
       if (spi_global_app_data->bus)
         droute_path_register (treepath, spi_global_app_data->bus);
     }
+
+  spi_cache_emit_ready ();
 }
 
 static gboolean
@@ -1122,6 +1163,12 @@ deactivate_bus ()
         }
 
       dbus_error_free (&error);
+    }
+
+  if (spi_global_app_data->register_pending)
+    {
+      dbus_pending_call_cancel (spi_global_app_data->register_pending);
+      spi_global_app_data->register_pending = NULL;
     }
 
   dbus_connection_close (spi_global_app_data->bus);
@@ -1305,7 +1352,6 @@ atk_bridge_adaptor_init (gint *argc, gchar **argv[])
 void
 atk_bridge_adaptor_cleanup (void)
 {
-  GList *l;
   GSList *ls;
 
   if (!inited)
@@ -1321,19 +1367,18 @@ atk_bridge_adaptor_cleanup (void)
 
   deactivate_bus ();
 
-  for (l = spi_global_app_data->direct_connections; l; l = l->next)
+  while (spi_global_app_data->direct_connections)
     {
       DBusConnection *connection;
 
-      connection = l->data;
+      connection = spi_global_app_data->direct_connections->data;
 
-      droute_context_unregister (spi_global_app_data->droute, connection);
-      droute_unintercept_dbus (connection);
+      dbus_connection_remove_filter (connection,
+                                     direct_connection_filter,
+                                     NULL);
       dbus_connection_close (connection);
-      dbus_connection_unref (connection);
+      remove_direct_connection (connection);
     }
-  g_list_free (spi_global_app_data->direct_connections);
-  spi_global_app_data->direct_connections = NULL;
 
   for (ls = clients; ls; ls = ls->next)
     g_free (ls->data);

@@ -347,13 +347,29 @@ static gboolean atspi_inited = FALSE;
 static GHashTable *app_hash = NULL;
 
 static void
+call_get_items (AtspiApplication *app)
+{
+  DBusMessage *message;
+
+  if (atspi_no_cache || app->get_items_pending || app->get_items_finished)
+    return;
+
+  message = dbus_message_new_method_call (app->bus_name,
+                                          "/org/a11y/atspi/cache",
+                                          atspi_interface_cache, "GetItems");
+
+  dbus_connection_send_with_reply (app->bus, message, &app->get_items_pending, 2000);
+  dbus_message_unref (message);
+  if (app->get_items_pending)
+    dbus_pending_call_set_notify (app->get_items_pending, handle_get_items, app, NULL);
+}
+
+static void
 handle_get_bus_address (DBusPendingCall *pending, void *user_data)
 {
   AtspiApplication *app = user_data;
   DBusMessage *reply = dbus_pending_call_steal_reply (pending);
-  DBusMessage *message;
   const char *address;
-  DBusPendingCall *new_pending;
 
   if (dbus_message_get_type (reply) == DBUS_MESSAGE_TYPE_METHOD_RETURN)
     {
@@ -377,9 +393,10 @@ handle_get_bus_address (DBusPendingCall *pending, void *user_data)
             }
           else
             {
+              guint pid = atspi_accessible_get_process_id (app->root, NULL);
               if (!strcmp (error.name, DBUS_ERROR_FILE_NOT_FOUND) &&
-                  !g_getenv ("ATSPI_IN_TESTS"))
-                g_warning ("AT-SPI: Unable to open bus connection: %s", error.message);
+                  !g_getenv ("ATSPI_IN_TESTS") && pid != -1)
+                g_warning ("AT-SPI: Unable to open bus connection for application with pid %d: %s", pid, error.message);
               dbus_error_free (&error);
             }
         }
@@ -390,15 +407,7 @@ handle_get_bus_address (DBusPendingCall *pending, void *user_data)
   if (!app->bus)
     return; /* application has gone away / been disposed */
 
-  message = dbus_message_new_method_call (app->bus_name,
-                                          "/org/a11y/atspi/cache",
-                                          atspi_interface_cache, "GetItems");
-
-  dbus_connection_send_with_reply (app->bus, message, &new_pending, 2000);
-  dbus_message_unref (message);
-  if (!new_pending)
-    return;
-  dbus_pending_call_set_notify (new_pending, handle_get_items, app, NULL);
+  call_get_items (app);
 }
 
 static AtspiApplication *
@@ -408,6 +417,7 @@ get_application (const char *bus_name)
   char *bus_name_dup;
   DBusMessage *message;
   DBusPendingCall *pending = NULL;
+  const char *disable_p2p;
 
   if (!app_hash)
     {
@@ -424,17 +434,18 @@ get_application (const char *bus_name)
   gettimeofday (&app->time_added, NULL);
   app->cache = ATSPI_CACHE_UNDEFINED;
   g_hash_table_insert (app_hash, bus_name_dup, app);
-  message = dbus_message_new_method_call (bus_name, atspi_path_root,
-                                          atspi_interface_application, "GetApplicationBusAddress");
 
-  dbus_connection_send_with_reply (app->bus, message, &pending, 2000);
-  dbus_message_unref (message);
-  if (!pending)
+  disable_p2p = g_getenv ("ATSPI_DISABLE_P2P");
+  if (!disable_p2p || atoi (disable_p2p) == 0)
     {
-      g_hash_table_remove (app_hash, bus_name_dup);
-      return NULL;
+      message = dbus_message_new_method_call (bus_name, atspi_path_root,
+                                              atspi_interface_application, "GetApplicationBusAddress");
+      dbus_connection_send_with_reply (app->bus, message, &pending, 2000);
+      dbus_message_unref (message);
+      if (pending)
+        dbus_pending_call_set_notify (pending, handle_get_bus_address, app, NULL);
     }
-  dbus_pending_call_set_notify (pending, handle_get_bus_address, app, NULL);
+
   return app;
 }
 
@@ -523,6 +534,16 @@ handle_remove_accessible (DBusConnection *bus, DBusMessage *message)
     return DBUS_HANDLER_RESULT_HANDLED;
   g_object_run_dispose (G_OBJECT (a));
   g_object_unref (a); /* unref our own ref */
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult
+handle_ready (DBusConnection *bus, DBusMessage *message)
+{
+  const char *sender = dbus_message_get_sender (message);
+  AtspiApplication *app = get_application (sender);
+
+  call_get_items (app);
   return DBUS_HANDLER_RESULT_HANDLED;
 }
 
@@ -700,15 +721,20 @@ add_accessible_from_iter (DBusMessageIter *iter)
 static void
 handle_get_items (DBusPendingCall *pending, void *user_data)
 {
+  AtspiApplication *app = user_data;
   DBusMessage *reply = dbus_pending_call_steal_reply (pending);
   DBusMessageIter iter, iter_array;
+
+  app->get_items_pending = NULL;
 
   if (dbus_message_get_type (reply) == DBUS_MESSAGE_TYPE_ERROR)
     {
       const char *sender = dbus_message_get_sender (reply);
       const char *error = NULL;
       const char *error_name = dbus_message_get_error_name (reply);
-      if (!strcmp (error_name, DBUS_ERROR_SERVICE_UNKNOWN) || !strcmp (error_name, DBUS_ERROR_NO_REPLY))
+      if (!strcmp (error_name, DBUS_ERROR_SERVICE_UNKNOWN) ||
+          !strcmp (error_name, DBUS_ERROR_NO_REPLY) ||
+          !strcmp (error_name, DBUS_ERROR_UNKNOWN_METHOD))
         {
         }
       else
@@ -721,6 +747,8 @@ handle_get_items (DBusPendingCall *pending, void *user_data)
       dbus_pending_call_unref (pending);
       return;
     }
+
+  app->get_items_finished = TRUE;
 
   dbus_message_iter_init (reply, &iter);
   dbus_message_iter_recurse (&iter, &iter_array);
@@ -928,6 +956,10 @@ process_deferred_message (BusDataClosure *closure)
     {
       handle_remove_accessible (closure->bus, closure->message);
     }
+  else if (dbus_message_is_signal (closure->message, atspi_interface_cache, "Ready"))
+    {
+      handle_ready (closure->bus, closure->message);
+    }
   else if (dbus_message_is_signal (closure->message, "org.freedesktop.DBus", "NameOwnerChanged"))
     {
       handle_name_owner_changed (closure->bus, closure->message);
@@ -1031,12 +1063,26 @@ atspi_dbus_filter (DBusConnection *bus, DBusMessage *message, void *data)
     {
       return defer_message (bus, message);
     }
+  if (dbus_message_is_signal (message, atspi_interface_cache, "Ready"))
+    {
+      return defer_message (bus, message);
+    }
   if (dbus_message_is_signal (message, "org.freedesktop.DBus", "NameOwnerChanged"))
     {
       defer_message (bus, message);
       return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     }
   return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+static void
+add_signal_match (DBusConnection *bus, const gchar *interface, const gchar *signal)
+{
+  gchar *match;
+
+  match = g_strdup_printf ("type='signal',interface='%s',member='%s'", interface, signal);
+  dbus_bus_add_match (bus, match, NULL);
+  g_free (match);
 }
 
 /**
@@ -1049,7 +1095,6 @@ atspi_dbus_filter (DBusConnection *bus, DBusMessage *message, void *data)
 int
 atspi_init (void)
 {
-  char *match;
   const gchar *no_cache;
 
   if (atspi_inited)
@@ -1067,25 +1112,14 @@ atspi_init (void)
   dbus_bus_register (bus, NULL);
   atspi_dbus_connection_setup_with_g_main (bus, g_main_context_default ());
   dbus_connection_add_filter (bus, atspi_dbus_filter, NULL, NULL);
-  match = g_strdup_printf ("type='signal',interface='%s',member='AddAccessible'", atspi_interface_cache);
-  dbus_bus_add_match (bus, match, NULL);
-  g_free (match);
-  match = g_strdup_printf ("type='signal',interface='%s',member='RemoveAccessible'", atspi_interface_cache);
-  dbus_bus_add_match (bus, match, NULL);
-  g_free (match);
-  match = g_strdup_printf ("type='signal',interface='%s',member='ChildrenChanged'", atspi_interface_event_object);
-  dbus_bus_add_match (bus, match, NULL);
-  g_free (match);
-  match = g_strdup_printf ("type='signal',interface='%s',member='PropertyChange'", atspi_interface_event_object);
-  dbus_bus_add_match (bus, match, NULL);
-  g_free (match);
-  match = g_strdup_printf ("type='signal',interface='%s',member='StateChanged'", atspi_interface_event_object);
-  dbus_bus_add_match (bus, match, NULL);
-  g_free (match);
+  add_signal_match (bus, atspi_interface_cache, "AddAccessible");
+  add_signal_match (bus, atspi_interface_cache, "RemoveAccessible");
+  add_signal_match (bus, atspi_interface_cache, "Ready");
+  add_signal_match (bus, atspi_interface_event_object, "ChildrenChanged");
+  add_signal_match (bus, atspi_interface_event_object, "PropertyChange");
+  add_signal_match (bus, atspi_interface_event_object, "StateChanged");
 
-  dbus_bus_add_match (bus,
-                      "type='signal', interface='org.freedesktop.DBus', member='NameOwnerChanged'",
-                      NULL);
+  add_signal_match (bus, "org.freedesktop.DBus", "NameOwnerChanged");
 
   no_cache = g_getenv ("ATSPI_NO_CACHE");
   if (no_cache && g_strcmp0 (no_cache, "0") != 0)
@@ -2213,8 +2247,8 @@ _atspi_strdup_and_adjust_for_dbus (const char *s)
  * @micro: (out): the micro/patch version.
  *
  * Returns the version of the AT-SPI library being used at runtime.
-
-* Since: 2.50
+ *
+ * Since: 2.50
  */
 void
 atspi_get_version (gint *major, gint *minor, gint *micro)
@@ -2287,4 +2321,30 @@ void
 atspi_set_g_main_loop_reentrancy (gboolean enabled)
 {
   dbind_set_g_main_loop_reentrancy (enabled);
+}
+
+AtspiAccessible *
+_atspi_get_accessible_from_pid (pid_t pid)
+{
+  AtspiAccessible *desktop = atspi_get_desktop (0);
+  gint count = atspi_accessible_get_child_count (desktop, NULL);
+  gint i;
+  guint child_pid;
+
+  for (i = 0; i < count; i++)
+    {
+      AtspiAccessible *child = atspi_accessible_get_child_at_index (desktop, i, NULL);
+      if (!child)
+        continue;
+      child_pid = atspi_accessible_get_process_id (child, NULL);
+      if (child_pid == pid)
+        {
+          g_object_unref (desktop);
+          return child;
+        }
+      g_object_unref (child);
+    }
+
+  g_object_unref (desktop);
+  return NULL;
 }

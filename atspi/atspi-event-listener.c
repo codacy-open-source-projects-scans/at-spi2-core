@@ -53,7 +53,7 @@ typedef struct
   char *name;
   char *detail;
   GArray *properties;
-  AtspiAccessible *app;
+  gchar *app_name;
 } EventListenerEntry;
 
 G_DEFINE_TYPE (AtspiEventListener, atspi_event_listener, G_TYPE_OBJECT)
@@ -255,8 +255,7 @@ cache_process_property_change (AtspiEvent *event)
 {
   if (!strcmp (event->type, "object:property-change:accessible-parent"))
     {
-      if (event->source->accessible_parent)
-        g_object_unref (event->source->accessible_parent);
+      AtspiAccessible *old_parent = event->source->accessible_parent;
       if (G_VALUE_HOLDS (&event->any_data, ATSPI_TYPE_ACCESSIBLE))
         {
           event->source->accessible_parent = g_value_dup_object (&event->any_data);
@@ -267,6 +266,7 @@ cache_process_property_change (AtspiEvent *event)
           event->source->accessible_parent = NULL;
           event->source->cached_properties &= ~ATSPI_CACHE_PARENT;
         }
+      g_clear_object (&old_parent);
     }
   else if (!strcmp (event->type, "object:property-change:accessible-name"))
     {
@@ -374,7 +374,7 @@ demarshal_rect (DBusMessageIter *iter, AtspiRect *rect)
 }
 
 static gboolean
-convert_event_type_to_dbus (const char *eventType, char **categoryp, char **namep, char **detailp, AtspiAccessible *app, GPtrArray **matchrule_array)
+convert_event_type_to_dbus (const char *eventType, char **categoryp, char **namep, char **detailp, char *app_name, GPtrArray **matchrule_array)
 {
   gchar *tmp = _atspi_strdup_and_adjust_for_dbus (eventType);
   char *category = NULL, *name = NULL, *detail = NULL;
@@ -398,10 +398,10 @@ convert_event_type_to_dbus (const char *eventType, char **categoryp, char **name
       gchar *matchrule;
       (*matchrule_array) = g_ptr_array_new ();
       matchrule = g_strdup_printf ("type='signal',interface='org.a11y.atspi.Event.%s'", category);
-      if (app)
+      if (app_name)
         {
           gchar *new_str = g_strconcat (matchrule, ",sender='",
-                                        app->parent.app->bus_name, "'",
+                                        app_name, "'",
                                         NULL);
           g_free (matchrule);
           matchrule = new_str;
@@ -455,8 +455,8 @@ listener_entry_free (EventListenerEntry *e)
 
   g_array_free (e->properties, TRUE);
 
-  if (e->app)
-    g_object_unref (e->app);
+  if (e->app_name)
+    g_free (e->app_name);
 
   g_free (e);
 }
@@ -640,8 +640,9 @@ atspi_event_listener_register_with_app (AtspiEventListener *listener,
 static gboolean
 notify_event_registered (EventListenerEntry *e)
 {
-  const char *app_path = (e->app ? e->app->parent.app->bus_name : "");
+  const char *app_path = (e->app_name ? e->app_name : "");
 
+  g_debug ("Calling RegisterEvent: event_type=%s app=%s", e->event_type, app_path);
   dbind_method_call_reentrant (_atspi_bus (), atspi_bus_registry,
                                atspi_path_registry,
                                atspi_interface_registry,
@@ -753,6 +754,7 @@ atspi_event_listener_register_from_callback_with_app (AtspiEventListenerCB callb
   DBusError d_error;
   GPtrArray *matchrule_array;
   gint i;
+  char *app_name = NULL;
 
   if (!callback)
     {
@@ -765,6 +767,17 @@ atspi_event_listener_register_from_callback_with_app (AtspiEventListenerCB callb
       return FALSE;
     }
 
+  if (app)
+    {
+      if (!app->parent.app->bus_name)
+        {
+          g_warning ("Attempt to register an event listener for a disposed application");
+          return FALSE;
+        }
+      app_name = app->parent.app->bus_name;
+    }
+
+  g_debug ("Registering event listener for %s", event_type);
   e = g_new0 (EventListenerEntry, 1);
   e->event_type = g_strdup (event_type);
   e->callback = callback;
@@ -772,20 +785,21 @@ atspi_event_listener_register_from_callback_with_app (AtspiEventListenerCB callb
   e->callback_destroyed = callback_destroyed;
   callback_ref (callback == remove_datum ? (gpointer) user_data : (gpointer) callback,
                 callback_destroyed);
-  if (!convert_event_type_to_dbus (event_type, &e->category, &e->name, &e->detail, app, &matchrule_array))
+  if (!convert_event_type_to_dbus (event_type, &e->category, &e->name, &e->detail, app_name, &matchrule_array))
     {
       g_free (e->event_type);
       g_free (e);
       return FALSE;
     }
-  if (app)
-    e->app = g_object_ref (app);
+  if (app_name)
+    e->app_name = g_strdup (app_name);
   e->properties = copy_event_properties (properties);
   event_listeners = g_list_prepend (event_listeners, e);
   for (i = 0; i < matchrule_array->len; i++)
     {
       char *matchrule = g_ptr_array_index (matchrule_array, i);
       dbus_error_init (&d_error);
+      g_debug ("Calling dbus_bus_add_match for match rule%s", matchrule);
       dbus_bus_add_match (_atspi_bus (), matchrule, &d_error);
       if (dbus_error_is_set (&d_error))
         {
@@ -899,7 +913,8 @@ atspi_event_listener_deregister_from_callback (AtspiEventListenerCB callback,
   gint i;
   GList *l;
 
-  if (!convert_event_type_to_dbus (event_type, &category, &name, &detail, NULL, &matchrule_array))
+  g_debug ("Deregistering event listener for %s", event_type);
+  if (!convert_event_type_to_dbus (event_type, &category, &name, &detail, NULL, NULL))
     {
       return FALSE;
     }
@@ -919,6 +934,7 @@ atspi_event_listener_deregister_from_callback (AtspiEventListenerCB callback,
         {
           DBusMessage *message, *reply;
           l = g_list_next (l);
+          const char *app_bus_name = (e->app_name ? e->app_name : "");
           if (in_send)
             {
               pending_removals = g_list_remove (pending_removals, e);
@@ -926,18 +942,25 @@ atspi_event_listener_deregister_from_callback (AtspiEventListenerCB callback,
             }
           else
             event_listeners = g_list_remove (event_listeners, e);
-          for (i = 0; i < matchrule_array->len; i++)
+          if (convert_event_type_to_dbus (event_type, NULL, NULL, NULL, e->app_name, &matchrule_array))
             {
-              char *matchrule = g_ptr_array_index (matchrule_array, i);
-              dbus_bus_remove_match (_atspi_bus (), matchrule, NULL);
+              for (i = 0; i < matchrule_array->len; i++)
+                {
+                  char *matchrule = g_ptr_array_index (matchrule_array, i);
+                  g_debug ("Calling dbus_bus_remove_match for match rule %s", matchrule);
+                  dbus_bus_remove_match (_atspi_bus (), matchrule, NULL);
+                  g_free (matchrule);
+                }
+              g_ptr_array_free (matchrule_array, TRUE);
             }
+          g_debug ("Calling DeregisterEvent: event_type=%s app=%s", event_type, app_bus_name);
           message = dbus_message_new_method_call (atspi_bus_registry,
                                                   atspi_path_registry,
                                                   atspi_interface_registry,
                                                   "DeregisterEvent");
           if (!message)
             return FALSE;
-          dbus_message_append_args (message, DBUS_TYPE_STRING, &event_type, DBUS_TYPE_INVALID);
+          dbus_message_append_args (message, DBUS_TYPE_STRING, &event_type, DBUS_TYPE_STRING, &app_bus_name, DBUS_TYPE_INVALID);
           reply = _atspi_dbus_send_with_reply_and_block (message, error);
           if (reply)
             dbus_message_unref (reply);
@@ -952,9 +975,6 @@ atspi_event_listener_deregister_from_callback (AtspiEventListenerCB callback,
   g_free (name);
   if (detail)
     g_free (detail);
-  for (i = 0; i < matchrule_array->len; i++)
-    g_free (g_ptr_array_index (matchrule_array, i));
-  g_ptr_array_free (matchrule_array, TRUE);
   return TRUE;
 }
 
@@ -1073,10 +1093,9 @@ _atspi_send_event (AtspiEvent *e)
       if (!strcmp (category, entry->category) &&
           (entry->name == NULL || !strcmp (name, entry->name)) &&
           detail_matches_listener (detail, entry->detail) &&
-          (entry->app == NULL || (entry->app->parent.app != NULL &&
-                                  e->source->parent.app != NULL &&
-                                  !strcmp (entry->app->parent.app->bus_name,
-                                           e->source->parent.app->bus_name))))
+          (entry->app_name == NULL || (e->source->parent.app != NULL &&
+                                       !strcmp (entry->app_name,
+                                                e->source->parent.app->bus_name))))
         {
           GList *l2;
           for (l2 = called_listeners; l2; l2 = l2->next)

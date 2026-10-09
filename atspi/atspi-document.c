@@ -23,6 +23,27 @@
 
 #include "atspi-private.h"
 
+static AtspiTextSelection *
+atspi_text_selection_copy (AtspiTextSelection *src)
+{
+  AtspiTextSelection *dst = g_new (AtspiTextSelection, 1);
+  dst->start_object = g_object_ref (src->start_object);
+  dst->start_offset = src->start_offset;
+  dst->end_object = g_object_ref (src->end_object);
+  dst->end_offset = src->end_offset;
+  return dst;
+}
+
+static void
+atspi_text_selection_free (AtspiTextSelection *selection)
+{
+  g_clear_object (&selection->start_object);
+  g_clear_object (&selection->end_object);
+  g_free (selection);
+}
+
+G_DEFINE_BOXED_TYPE (AtspiTextSelection, atspi_text_selection, atspi_text_selection_copy, atspi_text_selection_free)
+
 /**
  * atspi_document_get_locale:
  * @obj: a pointer to the #AtspiDocument object on which to operate.
@@ -187,7 +208,7 @@ clear_text_selection (void *data)
  *
  * Returns an array of AtspiTextSelections within this document.
  *
- * Returns: (element-type AtspiTextSelection) (transfer full): a GArray of
+ * Returns: (element-type AtspiTextSelection) (transfer container): a GArray of
  * AtspiTextSelection structures representing the selection.
  *
  * Since: 2.52
